@@ -74,3 +74,8 @@ Licensed under [Apache License 2.0](LICENSE). Based on:
 - [NebuSec/CyberMeowfia](https://github.com/NebuSec/CyberMeowfia)
 - [JoinChang/ghostlock-oneplus](https://github.com/JoinChang/ghostlock-oneplus)
 - [x-spy/CVE-2026-43499-popsicle](https://github.com/x-spy/CVE-2026-43499-popsicle)
+
+## Créditos
+
+Créditos completos a todos os projetos e autores usados: [CREDITS.md](CREDITS.md).
+
