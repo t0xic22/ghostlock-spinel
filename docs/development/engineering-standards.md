@@ -1,4 +1,4 @@
-English | [简体中文](engineering-standards_ZH.md)
+English (the Chinese counterpart was removed in this fork to standardise on English)
 
 # GhostLock engineering and design standards
 
@@ -318,7 +318,7 @@ python3 tools/cmp_disasm.py <baseline-binary> build/native/ghostlock
 `KernelSU ready`, and no kernel panic. At minimum, repeat the run and record the run count.
 
 **Archive**: use the template in `documentation-standards.md`. Logs correspond to the device's
-`Download/ghostlock-debug-log/<时间>/` directory.
+`Download/ghostlock-debug-log/<timestamp>/` directory.
 
 ### 8.4 Attribution discipline
 

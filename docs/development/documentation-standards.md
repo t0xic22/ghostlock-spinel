@@ -1,4 +1,4 @@
-English | [简体中文](documentation-standards_ZH.md)
+English (the Chinese counterpart was removed in this fork to standardise on English)
 
 # Documentation standards
 
@@ -29,7 +29,7 @@ Write each piece of content in one place and link to it elsewhere. Update an exi
 - Make facts traceable. Cite history with `git show <commit>:<path>`. Plans and gate records must include a commit and date.
 - Do not overpromise. Avoid words such as "seamless", "perfect", and "complete" as unsupported claims.
 - Keep terms consistent. Do not translate `route`, `profile`, `gate`, `handoff`, `waiter`, or `payload`. Use full-width punctuation in Chinese, and backticks for code and English terms.
-- Use MUST, SHOULD, and MAY in normative text, corresponding to 必须, 应当, and 可以. Do not use a commanding tone in other documents.
+- Use MUST, SHOULD, and MAY in normative text, corresponding to the RFC 2119 keywords MUST, SHOULD and MAY. Do not use a commanding tone in other documents.
 - Follow Google style for English: active voice, second person, present tense, and sentence case headings.
 - Use relative links. Cross-document references name the file, not a section number.
 

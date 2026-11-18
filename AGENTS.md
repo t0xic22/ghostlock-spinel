@@ -1,149 +1,241 @@
-# AGENTS.md
+# AGENTS.md — Developer Guide (English)
 
-GhostLock：Android 内核提权工具。通过 PI-futex 竞争覆盖 waiter，依次完成
-W1（SELinux）、W2（凭据/uid 0）、W3（seccomp），最后 handoff 给 root child 做
-KernelSU 模块加载。内核按精确 `uname -r` 匹配 HOCON profile，未匹配即拒绝运行。
+This file explains what the codebase does and the rules that must be followed when
+modifying it. Every section describes the actual behaviour, not just a summary.
 
-## 三层架构
+## What GhostLock does
 
-| 层        | 位置                | 说明                                                                                       |
-| --------- | ------------------- | ------------------------------------------------------------------------------------------ |
-| Android   | `app/`              | Kotlin/Compose UI、HOCON profile 解析/合并/覆盖、Shizuku UserService、日志                 |
-| Native    | `src/core/`         | C++23 攻击 runtime，产物 `build/native/ghostlock`                                          |
-| Extractor | `tools/extract_rs/` | Rust；boot.img / OTA / URL → `--format conf`（flatten GLK profile）/ `--format json`（v1） |
+GhostLock is an Android local privilege escalation (LPE) tool. It wins a PI-futex
+race to overwrite a waiter object, then runs three write stages in order:
 
-- Native 不是 JNI：`libghostlock.so` 是可执行 ELF，由 Kotlin `ProcessBuilder` 启动。
-  CLI：`--ghostlock-app-call`（stdin GLK1）/ `--load-prebuilt-profile <bin>`
-  （无参数的 v1 `offsets.json` 入口已移除）。入口细节见
-  `docs/analysis/native-entrypoint-plan.md`（git 历史）。
-- 内置 profile 在 `app/src/main/assets/kernel_profiles/`：`index.conf` 索引、
-  `<uname-r>.conf` 每 release 一份、`execution-*.conf` 公共/分 route 调参、
-  `credential-6x.conf`、`kernelsnitch-6x.conf`。格式为 HOCON（支持 `include`）。
-- 组件模型：frontend（`root_child`；`umh_forward` 占位不可用）× backend（`cve_2026_43499`；
-  `cve_2026_64560` 占位不可用）× middleware（`select_stack` / `tcp_zerocopy` / `multicast_waiter`），
-  由 `Pipeline<F,B,M>` 编译期固定。组合与可用性的唯一权威是 `route/component_catalog.hpp`，
-  选择显式来自 profile/wire，不从 kernel 版本推断。
+1. **W1** — disable SELinux enforcement.
+2. **W2** — overwrite credentials to obtain `uid=0` (root).
+3. **W3** — bypass seccomp.
 
-## 常用命令
+Finally it hands off to a **root child** process that can load a KernelSU module.
+A kernel is accepted only when its exact `uname -r` matches a bundled HOCON
+profile. If no profile matches, the app refuses to run — this is intentional,
+because the exploit depends on kernel-specific symbol offsets.
+
+## Three-layer architecture
+
+| Layer | Location | What it actually does |
+|---|---|---|
+| Android | `app/` | Kotlin/Compose UI; parses, merges and overrides HOCON profiles; hosts the Shizuku `UserService`; writes debug logs. |
+| Native | `src/core/` | C++23 exploit runtime; builds to `build/native/ghostlock`. |
+| Extractor | `tools/extract_rs/` | Rust tool that reads `boot.img`, an OTA package or a URL and emits either a flattened GLK1 profile (`--format conf`) or the legacy v1 JSON (`--format json`). |
+
+Important details:
+
+- The native binary is **not JNI**. `libghostlock.so` is a standalone executable
+  ELF started by Kotlin with `ProcessBuilder`. Its CLI is
+  `--ghostlock-app-call` (reads a length-prefixed GLK1 document from stdin) or
+  `--load-prebuilt-profile <bin>`. The argument-less v1 `offsets.json` entry point
+  was removed.
+- Bundled profiles live in `app/src/main/assets/kernel_profiles/`:
+  `index.conf` is the index, `<uname-r>.conf` is one file per kernel release,
+  `execution-*.conf` holds shared/per-route tuning, and
+  `credential-6x.conf` / `kernelsnitch-6x.conf` are shared 6.x fragments.
+  The format is HOCON and supports `include`.
+- The component model is **frontend × backend × middleware**:
+  - frontend: `root_child` (the working one); `umh_forward` is an unusable placeholder.
+  - backend: `cve_2026_43499` (working); `cve_2026_64560` is a placeholder.
+  - middleware: `select_stack`, `tcp_zerocopy`, `multicast_waiter`.
+  The combination is fixed at compile time by `Pipeline<F,B,M>`. The authoritative
+  catalogue is `route/component_catalog.hpp`; selection comes explicitly from the
+  profile/wire, never from the kernel version.
+
+## Common commands
 
 ```sh
-# Native
-make -C src ghostlock                 # NDK 构建（ANDROID_NDK_HOME 或 local.properties）
-make -C src native-host-tests         # 主机单元测试（含固定向量/生命周期）
-make -C src lint-tidy                 # clang-tidy，要求 0 findings
-ANDROID_NDK_HOME=... make -C src      # NDK 未自动探测时的显式写法
+# Native layer
+make -C src ghostlock          # NDK build (uses ANDROID_NDK_HOME or local.properties)
+make -C src native-host-tests  # host unit tests (fixed vectors + lifecycle checks)
+make -C src lint-tidy          # clang-tidy; must report 0 findings
+ANDROID_NDK_HOME=... make -C src   # explicit NDK path when auto-detection fails
 
-# Android / 提取器
+# Android / extractor
 ./gradlew :app:assembleDebug
 ./gradlew :app:testDebugUnitTest
-./gradlew exportKernelProfiles        # 生成 GLK1 .bin 到 build/kernel-profiles/
+./gradlew exportKernelProfiles  # writes GLK1 .bin files to build/kernel-profiles/
 (cd tools/extract_rs && cargo test --release)
 
-# 攻击函数形状对比（攻击路径改动必须跑）
+# Disassembly check — REQUIRED after any change to the attack path
 python3 tools/cmp_disasm.py <baseline-binary> build/native/ghostlock
 ```
 
-## 改动流程：先设计，后改动（强制）
+## Change workflow: design first, then code (mandatory)
 
-先读 `docs/development/design-philosophy.md`（设计思想：11 条原则，以 SWEBOK/ISO 12207/ISO 25010
-等软件工程理论为依据，含理论锚点与项目实例）。
-完整工程规范见 `docs/development/engineering-standards.md`（架构/数据流/控制流/数据结构/代码风格/
-文档/验证的详细规则 + 外部标准来源）。**任何改动前必须先完成设计**：
+Read `docs/development/design-philosophy.md` first. It contains 11 principles
+grounded in SWEBOK / ISO 12207 / ISO 25010, with theory anchors and project examples.
+The full engineering rules are in `docs/development/engineering-standards.md`.
 
-1. **Explore**：先读代码与文档；用 `git log --all -- <path>` 查历史设计与 device-gate 证据
-   （`docs/analysis/**` 全在 git 历史里）。
-2. **Design**：S 级（注释/格式）直接改；M 级写清动机/影响文件/行为差异/验证计划；**L 级**
-   （攻击关键路径、wire/profile 格式、跨 Native↔Kotlin 契约、公共数据结构、新增 route）
-   必须先产出计划文档（模板见 `docs/development/documentation-standards.md`）并获用户认可，再写代码。
-3. **Implement**：最小改动，只碰设计列出的文件；不动 `kernelsnitch/`、`LegacyProfileConverter.kt` 的 v1 转换与
-   规范中的"明确保留"清单。
-4. **Verify**：按级别跑满 §1.3 门槛并保留证据；汇报时给出命令与结果，不写"应该没问题"。
+Before **any** change:
 
-- 攻击路径改动 = `cmp_disasm`（8 函数）+ 真机门禁 + 门禁记录（格式见
-  `docs/development/documentation-standards.md`），缺一不可。
-- 大改动按批次推进，一个批次只做一类事，上一批验证通过再进下一批。
+1. **Explore** — read code and docs; use `git log --all -- <path>` for historical
+   design decisions and device-gate evidence (`docs/analysis/**` lives in git history).
+2. **Design** —
+   - S-level (comments/formatting): edit directly.
+   - M-level: document motivation, affected files, behaviour change and verification plan.
+   - **L-level** (attack-critical path, wire/profile format, Native↔Kotlin contracts,
+     public data structures, new routes): write a plan document first (template in
+     `docs/development/documentation-standards.md`) and get user approval before coding.
+3. **Implement** — smallest possible change; touch only files named in the design.
+   Do not touch `kernelsnitch/`, the v1 conversion in `LegacyProfileConverter.kt`,
+   or anything on the "explicitly preserved" list in the standards.
+4. **Verify** — run the full gate for the change level and keep evidence. Report
+   commands and results; never write "should be fine".
 
-## 代码约定
+- Attack-path changes require all three: `cmp_disasm` (8 functions) + a real-device
+  gate + a gate record (format in `docs/development/documentation-standards.md`).
+- Large changes are delivered in batches: one concern per batch, next batch only
+  after the previous one passes verification.
 
-- C++23、`-fno-rtti`、静态 libc++；`-Wall -Wextra -Wconversion -Wsign-conversion`，
-  新代码不得引入告警。include 用相对 `src/core` 的路径（如 `#include "route/tcp_zerocopy_route.h"`）。
-- 命名空间分层：`ghostlock::{route,session,memory,attack,race,support,profile}`；
-  `kernelsnitch/` 是上游原样移植代码，不要顺手重写。
-- 全局状态只允许 `g_exploit_session`（进程唯一 singleton）与启动期只读的
-  `g_direct_map_end`；新代码不得再引入可变全局或引用别名。审计记录见
-  `docs/analysis/native-global-state.md`（git 历史）。
-- 组件结构 = identity（kind，声明型，必须 host 可编译）+ 执行 policy（frontend/backend 步骤或
-  middleware route）。middleware policy 以编译期能力 + 静态 hook 表达，backend 步骤模板化在
-  middleware 上直接调用（不用虚基类）；Route 类满足 `prepare → execute → disarm → destroy`，
-  仅经 `status` 汇报。新增组件（middleware/backend/frontend）的完整触点清单见
-  `docs/development/adding-a-component.md`。
-- 双侧一致性（改了必须两边同步，测试会抓）：
-  - Native `profile/model.h` 的 `RouteKind`/`kRouteCatalog` ↔ Kotlin `data/route/RouteKind.kt`
-    （`route_catalog_test.cpp` / `RouteCatalogAgreementTest.kt` 断言同一列表）
-  - `profile/binary.cpp` 字段表 ↔ Kotlin route config 的 `entries()/apply()/from()`，键名逐字一致
-  - route 私有参数放 route 扩展节；只有共享代码会读的才进公共槽（顺序也必须一致）
-- 配置权威是 GLK1 profile + HOCON。执行层不得读配置类环境变量，只允许进程/路径类
-  （`GHOSTLOCK_HOME`、`TMPDIR`、`GHOSTLOCK_KSU_LOG`）。需要新状态就扩展 profile。
-- **不要随意新增或叠加配置/profile 传输格式版本号**。本分支统一为 **v2**（对象分段：
-  `header + sections[name → fields[name → u64]]`，presence 由键是否出现表达，值按位严格保存）。
-  Kotlin 与 native 版本绑定，同一分支内直接替换，不做旧版本兼容；不同 branch 需要不同格式时，
-  先改本节与 `docs/development/`，不要就地再起 v3/v4。
-- v1（旧 `offsets.json`）**只在 Kotlin 侧**由 `LegacyProfileConverter.kt` 转换为 v2；
-  native **不再解析 v1**（`src/core/legacy/` 的 JSON 路径已删除）。新 route/新字段不要改 v1 转换。
+## Code conventions
 
-## 核心攻击代码审查（仅触及时执行）
+- C++23, `-fno-rtti`, statically linked libc++; `-Wall -Wextra -Wconversion
+  -Wsign-conversion`. New code must not introduce warnings. Includes use paths
+  relative to `src/core` (e.g. `#include "route/tcp_zerocopy_route.h"`).
+- Namespaces: `ghostlock::{route,session,memory,attack,race,support,profile}`.
+  `kernelsnitch/` is verbatim upstream code — do not rewrite it.
+- Only two globals are allowed: `g_exploit_session` (the single process-wide
+  singleton) and `g_direct_map_end` (read-only after startup). No new mutable
+  globals or reference aliases; see `docs/analysis/native-global-state.md` in git
+  history for the audit.
+- A component = identity (a declarative `kind` that must compile on the host)
+  plus execution policy (frontend/backend steps, or a middleware route). Middleware
+  policy uses compile-time capabilities and static hooks; backend steps are
+  templates called directly on the middleware (no virtual base classes). A `Route`
+  implements `prepare → execute → disarm → destroy` and reports only through `status`.
+- Two-sided consistency (tests enforce both directions):
+  - Native `profile/model.h` `RouteKind`/`kRouteCatalog` ↔ Kotlin
+    `data/route/RouteKind.kt` (`route_catalog_test.cpp` / `RouteCatalogAgreementTest.kt`).
+  - `profile/binary.cpp` field table ↔ Kotlin route config `entries()/apply()/from()`
+    — key names must match exactly.
+  - Route-private parameters go in the route extension section; only fields read
+    by shared code go in the common slots (order matters there too).
+- Configuration authority is the GLK1 profile + HOCON. The execution layer must
+  not read configuration environment variables; only process/path ones are allowed:
+  `GHOSTLOCK_HOME`, `TMPDIR`, `GHOSTLOCK_KSU_LOG`. New state must extend the profile.
+- **Do not add or stack configuration/profile wire format version numbers.** This
+  branch uses **v2** only: object sections `header + sections[name → fields[name → u64]]`,
+  presence expressed by key existence, values stored bit-exact. Kotlin and native
+  are version-bound and replaced together in one branch — no backward compatibility.
+  If another branch needs a different format, change this document and
+  `docs/development/` first; never start a v3/v4 in place.
+- v1 (legacy `offsets.json`) is converted **only on the Kotlin side** by
+  `LegacyProfileConverter.kt`; native no longer parses v1 (the JSON path in
+  `src/core/legacy/` was deleted). Do not change the v1 conversion for new
+  routes/fields.
 
-以下审查只在改动触及核心攻击代码或其资源准备/回收路径时执行；普通 UI、文档、配置编辑器等未触及这些代码的改动不要求进行这组耗时检查。核心攻击代码包括 waiter/race/payload/route/exec 阶段代码，以及直接准备、持有、访问或回收其资源的代码。
+## Core attack code review (only when touched)
 
-- **所有权与生命周期追踪**：审查中按 Rust 式所有权思路列出每个关键对象、指针和资源的创建/获取起点、所有者、借用/访问者、访问区间、终结点及释放者。确认所有可能访问它的使用者都先于终结点停止访问；区分 owning、borrowed、shared 和 transferred ownership，并核对转移后旧所有者不再释放或访问。
-- **UAF 检查**：逐条检查普通对象与资源路径，确认不存在 use-after-free；只有作为漏洞原语而被有意利用的目标对象生命周期例外，不得把该例外扩展到辅助对象、race 状态、waiter、缓冲区、映射或同步资源。
-- **终结点与清理顺序**：确认销毁/回收发生在合理的生命周期边界，覆盖成功、失败、重试、取消和提前返回路径。重点核对 PI 相关内存与 waiter 生命周期：参与者停止访问、同步/解除关联、资源回收之间的既有先后关系不得因重构而改变；缺少明确终结点或顺序依据时不得合入。历史上曾因重构漏回收 PI 内存导致 panic，相关变更须特别检查资源回收位置和退出路径。
-- **核心代码标记与反汇编核对**：在审查记录中标出核心攻击函数，以及它们对应的资源准备、存活期和回收代码。每次触及核心攻击代码后的重构，都用 `tools/cmp_disasm.py` 对比已确认的基线二进制，并反汇编检查核心攻击代码和相关资源准备/回收代码的机器码及相对顺序；要求攻击代码与准备/回收之间的顺序保持不变。若字节差异无法证明不影响该不变量，停止该批次并调查，不以测试通过替代反汇编核对。
-- **范围与证据**：上述追踪表、差异结论和基线标识记录在该批次计划或审查记录中。检查仅针对被触及的核心代码及其资源生命周期闭包，不要求每个无关改动重跑；但该范围属于攻击关键路径时，仍须满足本文件“验证门槛”中的完整 `cmp_disasm`、真机门禁及归档要求。
+Run this only when a change touches the core attack code or the code that prepares,
+holds, accesses or recycles its resources. Ordinary UI, docs and config editor
+changes are exempt. Core code includes waiter/race/payload/route/exec stages and
+anything that directly manages their resources.
 
-## 验证门槛
+- **Ownership and lifetime tracking** — use Rust-style ownership reasoning: for
+  every key object/pointer/resource list where it is created, who owns it, who
+  borrows/accesses it, the access interval, the endpoint and who releases it.
+  Confirm every user stops accessing before the endpoint; distinguish owning,
+  borrowed, shared and transferred ownership, and verify the old owner does not
+  free or access after a transfer.
+- **UAF check** — walk every ordinary object and resource path and confirm there is
+  no use-after-free. The only exception is a target deliberately used as the
+  vulnerability primitive; never extend that exception to helpers, race state,
+  waiters, buffers, mappings or synchronisation resources.
+- **Endpoint and cleanup order** — verify destruction/recycling happens at sane
+  lifecycle boundaries across success, failure, retry, cancel and early-return.
+  In particular, preserve the existing order between PI memory/waiter access,
+  synchronisation/detachment and reclamation. Past refactors that missed PI memory
+  reclamation caused panics, so check cleanup locations and exit paths carefully.
+- **Core markers and disassembly comparison** — mark the core attack functions and
+  their prepare/hold/recycle code in the review record. After every refactor that
+  touches core code, compare against the confirmed baseline with `tools/cmp_disasm.py`
+  and disassemble the core functions plus their prepare/recycle code to verify
+  machine-code order. The order between attack code and prepare/recycle must not
+  change. If byte differences cannot prove that invariant, stop the batch and
+  investigate — passing tests do not replace disassembly review.
+- **Scope and evidence** — record the tracking table, diff conclusions and baseline
+  ID in the batch plan or review record. Only the touched code and its lifetime
+  closure need re-checking, but if that closure is attack-critical the full
+  `cmp_disasm` + device gate + archive requirements still apply.
 
-- 普通改动：`make -C src native-host-tests` + NDK 构建零警告 + `make -C src lint-tidy`。
-- 攻击关键路径（waiter/race/payload/route/exec 流程）改动：
-  1. `tools/cmp_disasm.py` 对比 8 个攻击函数，要求 IDENTICAL (strict) 或已复核的注解差异；
-  2. 真机门禁（冷机、固定 CPU 对、单 route、KernelSU 未加载的干净启动）；
-  3. 日志在设备 `Download/ghostlock-debug-log/<时间>/*.log.txt`（同目录另有
-     `profile.conf`/`profile.bin`，记录本次生效配置与送入 native 的 GLK1 字节），确认 route 命中与写验证通过。
-- 真机结果按 `docs/analysis/device-gates/*.md` 的格式归档（git 历史中有整套
-  S/CPP/U01/NS\* 证据链样例）。
-- `KERNEL-PANIC-01` 是已知环境/时序问题：同构建可 PASS/panic/PASS，判定因果要求同构建
-  复现 + 冷机复跑，不要仅凭一次 panic 归因代码。
-- 现实状态：Multicast（5.15）、TCP、Select 三条路径均已由开发者真机验证；新 profile
-  未过真机不得标 supported。
+## Verification gates
 
-## 文档约定
+- Ordinary change: `make -C src native-host-tests` + zero-warning NDK build +
+  `make -C src lint-tidy`.
+- Attack-critical change (waiter/race/payload/route/exec):
+  1. `tools/cmp_disasm.py` across 8 attack functions — IDENTICAL (strict) or a
+     reviewed annotated difference.
+  2. Real-device gate: cold boot, fixed CPU pair, single route, clean start with
+     KernelSU not loaded.
+  3. Logs on the device at `Download/ghostlock-debug-log/<timestamp>/*.log.txt`
+     (the same directory also holds `profile.conf`/`profile.bin`, recording the
+     effective configuration and the exact GLK1 bytes sent to native). Confirm
+     route hit and write verification.
+- Archive device results in the format of `docs/analysis/device-gates/*.md` (a
+  complete S/CPP/U01/NS* evidence set exists in git history).
+- `KERNEL-PANIC-01` is a known environment/timing issue: the same build can pass,
+  panic, then pass. Causality requires reproduction with the same build plus a
+  cold-boot rerun — never blame code from a single panic.
+- Current reality: Multicast (5.15), TCP and Select have all been verified on real
+  devices by the original developers. A new profile must not be marked `supported`
+  until it passes a real-device gate.
 
-- 完整规范见 `docs/development/documentation-standards.md`（分类地图、命名与结构、中英写作、
-  RFC 2119 用语、画图要求、计划/门禁模板、归档流程、检查清单；依据 ISO/IEC/IEEE 42010/15289/2651x、
-  Diátaxis、DITA、Minimalism、Google style）。
-- **结构与流程变化必须同步更新对应 Mermaid/UML 图**：L 级改动（route、跨层契约、会话/资源所有权、
-  攻击阶段机、清理边界）必须画图；一个结构只保留一处权威图，其他文档链接它。
-- 双语：`README.md` + `README_ZH.md`；`docs/**` 下有 `*_ZH.md` 对应的保持同步。
-- 现行文档：`README.md`、`docs/kernel_profiles/*`、`docs/development/adding-a-component.md`、
-  `docs/development/design-philosophy.md`（设计思想，改动前必读）、
-  `docs/development/engineering-standards.md`（工程规范，做法与门槛）、
-  `docs/development/documentation-standards.md`（文档规范）、`src/core/README.md`。
-- 历史文档（已从工作树删除，需要时从 git 历史取回：`git show <commit>:<path>`）：
-  - `docs/analysis/`：架构/迁移/解耦分析（routes、native-functions、native-cpp-current-uml、
-    native-global-state、native-entrypoint-plan、environment-convergence-plan 等）
-  - `docs/analysis/device-gates/`：S04–S15、CPP00–CPP17、U01、NSFUNC/NSMOD/NSMOD2、
-    PROFILE-\* 门禁证据链
-  - 根目录：`ARCHITECTURE.md`、`DECOUPLING_PLAN.md`、`DECOUPLING_LOG.md`、
-    `PR_DESCRIPTION.md`、`RELEASE_NOTE.md`；`docs/pr-note-*`、`docs/release-note-v1.*`、
-    `docs/development/native-modernization-plan.md`
-  - `repro/xperia-first-success/`（Xperia 5.15 首攻 V1–V21 实验史）
+## Documentation conventions
 
-## 排障
+- Full rules are in `docs/development/documentation-standards.md` (category map,
+  naming/structure, Chinese/English writing, RFC 2119 wording, diagram rules,
+  plan/gate templates, archive workflow, checklists; based on ISO/IEC/IEEE
+  42010/15289/2651x, Diátaxis, DITA, Minimalism, Google style).
+- **Structural and workflow changes must update the corresponding Mermaid/UML
+  diagram.** L-level changes (routes, cross-layer contracts, session/resource
+  ownership, attack stage machine, cleanup boundaries) require a diagram. Keep one
+  authoritative diagram per structure and link to it from other docs.
+- Bilingual upstream: `README.md` + `README_ZH.md`; every `docs/**` page had a
+  `*_ZH.md` counterpart. **In this fork those Chinese duplicates were removed and
+  the remaining documents standardised on English** — see `README.md`.
+- Active docs: `README.md`, `docs/kernel_profiles/*`,
+  `docs/development/adding-a-component.md`,
+  `docs/development/design-philosophy.md` (read before changes),
+  `docs/development/engineering-standards.md` (rules and gates),
+  `docs/development/documentation-standards.md`, `src/core/README.md`.
+- Historical docs were deleted from the working tree and can be recovered from git
+  history with `git show <commit>:<path>`:
+  `docs/analysis/**`, `docs/analysis/device-gates/**`, root `ARCHITECTURE.md`,
+  `DECOUPLING_PLAN.md`, `DECOUPLING_LOG.md`, `PR_DESCRIPTION.md`, `RELEASE_NOTE.md`,
+  `docs/pr-note-*`, `docs/release-note-v1.*`,
+  `docs/development/native-modernization-plan.md`, `repro/xperia-first-success/`.
 
-- Gradle native 构建找不到 NDK：设 `ANDROID_NDK_HOME` / `ANDROID_NDK_ROOT` 或
-  `local.properties` 的 `ndk.dir`。
-- Rust 交叉编译 Android：必须用 rustup 工具链的 `rustc`（Homebrew rustc 缺
-  `aarch64-linux-android` std），并 `rustup target add aarch64-linux-android`。
-- 生成物统一在 `build/` 下；不要提交 `build/`、`*.so`、`local.properties`。
-- 提交流程：分支 `very-not-stable-dev` → 上游 `main`；提交信息用
-  `type(scope): summary`（feat/fix/docs/refactor/test/chore）。未经要求不要 commit/push。
+## Troubleshooting
+
+- Gradle native build cannot find NDK: set `ANDROID_NDK_HOME` / `ANDROID_NDK_ROOT`
+  or `ndk.dir` in `local.properties`.
+- Rust cross-compilation for Android: use the rustup toolchain's `rustc` (Homebrew
+  rustc lacks the `aarch64-linux-android` std) and
+  `rustup target add aarch64-linux-android`.
+- All generated artefacts belong under `build/`; do not commit `build/`, `*.so`
+  or `local.properties`.
+- Upstream submission flow: branch `very-not-stable-dev` → upstream `main`;
+  commit messages use `type(scope): summary` (feat/fix/docs/refactor/test/chore).
+  Do not commit or push unless asked.
+
+## Fork-specific notes (this repository)
+
+This fork runs the **CVE-2026-98260 timer exploit** instead of the upstream
+`cve_2026_43499` backend, because the upstream route helper fails on this kernel.
+Consequences:
+
+- `app/src/main/jniLibs/arm64-v8a/libghostlock.so` is a prebuilt static ELF of the
+  timer exploit. The Gradle tasks that build the C++ core and the Rust extractor
+  are no-ops so the prebuilt binary is not overwritten.
+- `app/src/main/assets/kernel_profiles/6.12.69-...conf` plus its `index.conf` entry
+  exist only to satisfy the app's profile gate. The exploit has its own embedded
+  profile and validates `uname -r` internally; the HOCON offsets are not used.
+- `isKernelSupported()` returns `true` unconditionally for the same reason.
+- `android:appComponentFactory="androidx.core.app.CoreComponentFactory"` is declared
+  explicitly to work around a MediaTek/HyperOS bug in `LoadedApk.makeApplicationInner`.
+- The app must run through **Shizuku** (uid 2000, `u:r:shell:s0`, Seccomp=0) because
+  the exploit needs `tracefs` access that a normal app uid lacks.

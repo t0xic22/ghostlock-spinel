@@ -75,7 +75,27 @@ Licensed under [Apache License 2.0](LICENSE). Based on:
 - [JoinChang/ghostlock-oneplus](https://github.com/JoinChang/ghostlock-oneplus)
 - [x-spy/CVE-2026-43499-popsicle](https://github.com/x-spy/CVE-2026-43499-popsicle)
 
-## Créditos
+## Language standardisation in this fork
 
-Créditos completos a todos os projetos e autores usados: [CREDITS.md](CREDITS.md).
+The upstream project was bilingual (English + Chinese). This fork standardises
+**all documentation on English** so the adaptation is understandable without
+Chinese:
+
+- All `*_ZH.md` files were removed (22 files).
+- All Chinese comments in HOCON profile templates were translated into English
+  with explanations of what each field actually controls (8 `.conf` templates,
+  about 450 comment lines).
+- The two remaining Chinese phrases inside English docs were translated
+  (`<time>` to `<timestamp>`, and the RFC 2119 keyword mapping).
+- `res/values-zh/` (Chinese UI strings) was removed. `values/` (English) and
+  `values-pt/` (Portuguese) remain.
+- `AGENTS.md` was fully rewritten in English with detailed explanations of the
+  architecture, the change workflow, the verification gates and the fork-specific
+  deviations (CVE-2026-98260 backend, prebuilt binary, profile gate bypass).
+
+The app's runtime behaviour is unchanged by this standardisation.
+
+## Credits
+
+Full credits to every project and author used: [CREDITS.md](CREDITS.md).
 
